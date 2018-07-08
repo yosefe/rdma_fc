@@ -34,7 +34,9 @@ enum transport_type {
 };
 
 enum packet_type {
-    PACKET_FIN = 2
+    PACKET_SYN  = 0,
+    PACKET_FIN  = 1,
+    PACKET_LAST
 };
 
 #define LOG(_level, _fmt, ...) \
@@ -75,10 +77,12 @@ typedef struct {
     unsigned                  num_connections;
     int                       conn_timeout_ms;
     enum transport_type       transport;
-    size_t                    rdma_read_size;
+    enum ibv_wr_opcode        opcode;
+    size_t                    message_size;
+    size_t                    alignment;
     unsigned                  num_iterations;
-    size_t                    max_outstanding_reads;
-    size_t                    max_read_size;
+    size_t                    max_outstanding;
+    size_t                    max_seg_size;
     size_t                    tx_queue_len;
     size_t                    rx_queue_len;
     size_t                    max_send_sge;
@@ -98,11 +102,13 @@ typedef struct {
 typedef struct connection connection_t;
 struct connection {
     struct rdma_cm_id         *rdma_id;
+    int                       remote_conn_index;
     struct ibv_ah             *dc_ah;
     uint32_t                  remote_dctn;
     uint32_t                  rkey;
     uint64_t                  remote_addr;
-    size_t                    read_offset;
+    size_t                    message_offset;
+    unsigned                  num_recvd[PACKET_LAST];
     list_link_t               list;
 };
 
@@ -128,15 +134,16 @@ typedef struct {
     unsigned                  num_conns;
     unsigned                  num_established;
     unsigned                  num_disconnect;
-    unsigned                  num_fin_recvd;
+    unsigned                  barrier_count;
     unsigned                  recv_available;
-    unsigned long             num_outstanding_reads;
+    unsigned long             num_outstanding;
 } test_context_t;
 
 /* Control packet */
 typedef struct {
     uint8_t                   type;        /* packet_type */
     uint32_t                  conn_index;  /* index of connection to FIN */
+    int                       id;
 } packet_t;
 
 /* Private data passed over rdma_cm protocol */
@@ -149,8 +156,25 @@ typedef struct {
 } conn_priv_t;
 
 static const char* transport_names[] = {
-    [XPORT_RC] = "rc",
-    [XPORT_DC] = "dc"
+    [XPORT_RC]          = "RC",
+    [XPORT_DC]          = "DC"
+};
+
+static const char* opcode_names[] = {
+    [IBV_WR_SEND]       = "SEND",
+    [IBV_WR_RDMA_READ]  = "RDMA_READ",
+    [IBV_WR_RDMA_WRITE] = "RDMA_WRITE",
+};
+
+static const char* wc_opcode_names[] = {
+    [IBV_WC_SEND]       = "SEND",
+    [IBV_WC_RDMA_READ]  = "RDMA_READ",
+    [IBV_WC_RDMA_WRITE] = "RDMA_WRITE",
+};
+
+static const char* packet_names[] = {
+    [PACKET_SYN] = "SYN",
+    [PACKET_FIN] = "FIN"
 };
 
 options_t g_options = {
@@ -161,10 +185,12 @@ options_t g_options = {
     .num_connections       = 1,
     .conn_timeout_ms       = 2000,
     .transport             = XPORT_RC,
-    .rdma_read_size        = 1024 * 1024,
+    .opcode                = IBV_WR_RDMA_READ,
+    .message_size          = 1024 * 1024,
+    .alignment             = 64,
     .num_iterations        = 1000,
-    .max_outstanding_reads = 8,
-    .max_read_size         = 32768,
+    .max_outstanding       = SIZE_MAX,
+    .max_seg_size          = SIZE_MAX,
     .tx_queue_len          = 128,
     .rx_queue_len          = 128,
     .max_send_sge          = 1,
@@ -198,9 +224,11 @@ test_context_t g_test = {
     .num_conns       = 0,
     .num_established = 0,
     .num_disconnect  = 0,
-    .num_fin_recvd   = 0,
+    .barrier_count   = 0,
     .recv_available  = 0
 };
+
+static int poll_cq();
 
 static void usage(const options_t *defaults) {
     printf("Usage: many2one [ options ] [ server-address]\n");
@@ -210,27 +238,39 @@ static void usage(const options_t *defaults) {
     printf("                  possible values are:\n");
     printf("                    'rc' : Reliable Connection (RC) transport\n");
     printf("                    'dc' : Dynamic Connection (DC) transport\n");
+    printf("   -w <opcode>    WR opcode to use [RDMA_READ|RDMA_WRITE|SEND] (%s)\n", opcode_names[defaults->opcode]);
+    printf("   -s <size>      Message size (%zu)\n", defaults->message_size);
+    printf("   -a <boundary>  Message buffer alignment(%zu)\n", defaults->alignment);
     printf("   -v             Increase logging level\n");
     printf("   -G <index>     (DC only) GID index to use (%d)\n", defaults->gid_index);
     printf("   -T <class>     (DC only) Traffic class / DSCP to use (%d)\n", defaults->traffic_class);
     printf("   -H <limit>     (DC only) Hop limit / TTL (%d)\n", defaults->hop_limit);
     printf("   -S <sl>        (DC only) SL / Ethernet priority (%d)\n", defaults->sl);
-    printf("\n");
-    printf("Client options:\n");
     printf("   -t <ms>        Connection timeout, milliseconds (%d)\n", defaults->conn_timeout_ms);
-    printf("\n");
-    printf("Server options:\n");
     printf("   -n <num>       Number of connections to expect (%d)\n", defaults->num_connections);
     printf("   -i <num>       Number of iterations to run (%d)\n", defaults->num_iterations);
-    printf("   -r <size>      Maximal size of a single rdma read (%zu)\n", defaults->max_read_size);
-    printf("   -o <num>       Maximal number of outstanding reads (%zu)\n", defaults->max_outstanding_reads);
+    printf("   -r <size>      Maximal size of a single segment (%zu)\n", defaults->max_seg_size);
+    printf("   -o <num>       Maximal number of outstanding segments (%zu)\n", defaults->max_outstanding);
+}
+
+static int value_by_str(const char *str, const char **names, int max)
+{
+    int i;
+
+    for (i = 0; i < max; ++i) {
+        if (!strcasecmp(str, names[i])) {
+            return i;
+        }
+    }
+
+    return -1;
 }
 
 static int parse_opts(int argc, char **argv) {
     options_t defaults = g_options;
-    int c;
+    int ret, c;
 
-    while ( (c = getopt(argc, argv, "hp:n:vt:x:i:r:o:G:T:H:S:")) != -1 ) {
+    while ( (c = getopt(argc, argv, "hp:n:vt:s:a:x:w:i:r:o:G:T:H:S:")) != -1 ) {
         switch (c) {
         case 'p':
             g_options.port_num = atoi(optarg);
@@ -244,25 +284,42 @@ static int parse_opts(int argc, char **argv) {
         case 't':
             g_options.conn_timeout_ms = atoi(optarg);
             break;
+        case 's':
+            g_options.message_size = strtol(optarg, NULL, 0);
+            break;
+        case 'a':
+            g_options.alignment = atol(optarg);
+            break;
         case 'x':
-            if (!strcasecmp(optarg, transport_names[XPORT_RC])) {
-                g_options.transport = XPORT_RC;
-            } else if (!strcasecmp(optarg, transport_names[XPORT_DC])) {
-                g_options.transport = XPORT_DC;
-            } else {
+            ret = value_by_str(optarg, transport_names,
+                               sizeof(transport_names) / sizeof(transport_names[0]));
+            if (ret < 0) {
                 LOG_ERROR("Invalid transport name '%s'", optarg);
                 usage(&defaults);
-                return -1;
+                return ret;
             }
+
+            g_options.transport = ret;
+            break;
+        case 'w':
+            ret = value_by_str(optarg, opcode_names,
+                               sizeof(opcode_names) / sizeof(opcode_names[0]));
+            if (ret < 0) {
+                LOG_ERROR("Invalid opcode name '%s'", optarg);
+                usage(&defaults);
+                return ret;
+            }
+
+            g_options.opcode = ret;
             break;
         case 'i':
             g_options.num_iterations = atoi(optarg);
             break;
         case 'r':
-            g_options.max_read_size = atol(optarg);
+            g_options.max_seg_size = atol(optarg);
             break;
         case 'o':
-            g_options.max_outstanding_reads = atol(optarg);
+            g_options.max_outstanding = atol(optarg);
             break;
         case 'G':
             g_options.gid_index = atoi(optarg);
@@ -299,7 +356,7 @@ static int init_buffer(struct ibv_pd *pd, size_t size, buffer_t *buf)
         return 0; /* already initialized */
     }
 
-    buf->ptr = memalign(4096, size);
+    buf->ptr = memalign(g_options.alignment, size);
     if (!buf->ptr) {
         LOG_ERROR("Failed to allocate buffer");
         return -1;
@@ -617,7 +674,7 @@ static int init_transport(struct rdma_cm_event *event)
 
     /* Create buffer for RDMA (one buffer which is split between connections) */
     ret = init_buffer(event->id->pd,
-                      g_options.num_connections * g_options.rdma_read_size,
+                      g_options.num_connections * g_options.message_size,
                       &g_test.rdma_buf);
     if (ret) {
         return ret;
@@ -671,7 +728,7 @@ static int get_conn_param(struct rdma_cm_id *rdma_id,
     priv->conn_index          = conn_index;
     priv->rkey                = g_test.rdma_buf.mr->rkey;
     priv->virt_addr           = (uint64_t)g_test.rdma_buf.ptr +
-                                (conn_index * g_options.rdma_read_size);
+                                (conn_index * g_options.message_size);
     if (g_options.transport == XPORT_DC) {
         priv->dct_num         = g_test.dct->dct_num;
 
@@ -699,8 +756,9 @@ static int set_conn_param(connection_t *conn, struct rdma_cm_event *event)
     const conn_priv_t *remote_priv = event->param.conn.private_data;
     struct ibv_ah_attr ah_attr;
 
-    conn->remote_addr = remote_priv->virt_addr;
-    conn->rkey        = remote_priv->rkey;
+    conn->remote_addr       = remote_priv->virt_addr;
+    conn->rkey              = remote_priv->rkey;
+    conn->remote_conn_index = remote_priv->conn_index;
 
     if (g_options.transport == XPORT_DC) {
         memset(&ah_attr, 0, sizeof(ah_attr));
@@ -790,58 +848,168 @@ static int is_client()
     return strlen(g_options.dest_address);
 }
 
-/* send control message */
-static int send_control(connection_t *conn, enum packet_type type,
-                        unsigned conn_index)
+/* post post_operation, set *posted to 1 if the operation was posted, 0 if no
+ * available QP is found
+ */
+static int post_send(connection_t *conn, struct ibv_sge *sge,
+                     enum ibv_wr_opcode opcode, int send_flags,
+                     uintptr_t remote_addr, int *posted)
 {
-    packet_t packet = { .type = type,
-                        .conn_index = conn_index };
-    struct ibv_exp_send_wr exp_wr, *bad_exp_wr;
-    struct ibv_send_wr wr, *bad_wr;
+    char buf[100];
+    packet_t *hdr;
+    int dci;
+
+    switch (opcode) {
+    case IBV_WR_SEND:
+        hdr = (packet_t*)sge->addr;
+        snprintf(buf, sizeof(buf), "%s id %d", packet_names[hdr->type],\
+                 hdr->id);
+        break;
+    case IBV_WR_RDMA_READ:
+         snprintf(buf, sizeof(buf), "remote_address 0x%lx into 0x%lx",
+                  remote_addr, sge->addr);
+         break;
+    case IBV_WR_RDMA_WRITE:
+         snprintf(buf, sizeof(buf), "remote_address 0x%lx from 0x%lx",
+                  remote_addr, sge->addr);
+         break;
+    default:
+        snprintf(buf, sizeof(buf), "???");
+        break;
+   }
+
+    if (g_options.transport == XPORT_RC) {
+        struct ibv_send_wr wr, *bad_wr;
+
+        memset(&wr, 0, sizeof(wr));
+        wr.sg_list             = sge;
+        wr.num_sge             = 1;
+        wr.opcode              = opcode;
+        wr.send_flags          = IBV_SEND_SIGNALED | send_flags;
+        wr.wr.rdma.remote_addr = remote_addr;
+        wr.wr.rdma.rkey        = conn->rkey;
+
+        int ret = ibv_post_send(conn->rdma_id->qp, &wr, &bad_wr);
+        if (ret) {
+            LOG_DEBUG("ibv_post_send() failed: %m");
+            return ret;
+        }
+
+        *posted = 1;
+
+        LOG_TRACE("%s on QP 0x%x %s length %u",
+                  opcode_names[opcode], conn->rdma_id->qp->qp_num, buf,
+                  sge->length);
+    } else if (g_options.transport == XPORT_DC) {
+
+        struct ibv_exp_send_wr wr, *bad_wr;
+
+        if (!g_test.free_dci_bitmap) {
+            *posted = 0;
+            goto out;
+        }
+
+        /* find an available DCI */
+        dci = __builtin_ffsl(g_test.free_dci_bitmap) - 1;
+        assert(g_test.dci_outstanding[dci] == 0);
+
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id               = dci;
+        wr.sg_list             = sge;
+        wr.num_sge             = 1;
+        wr.exp_opcode          = opcode;
+        wr.exp_send_flags      = IBV_EXP_SEND_SIGNALED | send_flags;
+        wr.wr.rdma.remote_addr = remote_addr;
+        wr.wr.rdma.rkey        = conn->rkey;
+        wr.dc.ah               = conn->dc_ah;
+        wr.dc.dct_number       = conn->remote_dctn;
+        wr.dc.dct_access_key   = DC_KEY;
+
+        int ret = ibv_exp_post_send(g_test.dcis[dci], &wr, &bad_wr);
+        if (ret) {
+            LOG_DEBUG("ibv_post_send() failed: %m");
+            return ret;
+        }
+
+        ++g_test.dci_outstanding[dci];
+        g_test.free_dci_bitmap &= ~BIT(dci);
+        *posted = 1;
+
+        LOG_TRACE("%s on DCI[%d] 0x%x %s length %u",
+                  opcode_names[opcode], dci, g_test.dcis[dci]->qp_num, buf,
+                  sge->length);
+    } else {
+        *posted = 0;
+    }
+
+    /* Update counters */
+    if (*posted) {
+        ++g_test.num_outstanding;
+    }
+
+out:
+    return 0;
+}
+
+/* send control message */
+static int send_control(connection_t *conn, enum packet_type type, int id)
+{
+    packet_t packet = { .type       = type,
+                        .conn_index = conn->remote_conn_index,
+                        .id         = id };
     struct ibv_sge sge;
-    int dci, ret;
+    int posted;
+    int ret;
 
     sge.addr   = (uintptr_t)&packet;
     sge.length = sizeof(packet);
     sge.lkey   = 0;
 
-    if (g_options.transport == XPORT_DC) {
-        dci = rand() % NUM_DCI;
-        assert(g_test.dci_outstanding[dci] < g_options.tx_queue_len);
+    assert(IBV_SEND_INLINE == IBV_EXP_SEND_INLINE);
 
-        memset(&exp_wr, 0, sizeof(exp_wr));
-        exp_wr.wr_id             = dci;
-        exp_wr.sg_list           = &sge;
-        exp_wr.num_sge           = 1;
-        exp_wr.exp_opcode        = IBV_EXP_WR_SEND;
-        exp_wr.exp_send_flags    = IBV_EXP_SEND_INLINE | IBV_EXP_SEND_SIGNALED;
-        exp_wr.dc.ah             = conn->dc_ah;
-        exp_wr.dc.dct_access_key = DC_KEY;
-        exp_wr.dc.dct_number     = conn->remote_dctn;
-
-        ret = ibv_exp_post_send(g_test.dcis[dci], &exp_wr, &bad_exp_wr);
-        if (ret) {
-            LOG_ERROR("ibv_exp_post_send() failed: %m");
-            return -1;
+    for (;;) {
+        ret = post_send(conn, &sge, IBV_WR_SEND, IBV_SEND_INLINE, 0, &posted);
+        if (ret < 0) {
+            return ret;
+        } else if (posted) {
+            break;
         }
 
-        ++g_test.dci_outstanding[dci];
-    } else if (g_options.transport == XPORT_RC) {
-        memset(&wr, 0, sizeof(wr));
-        wr.sg_list    = &sge;
-        wr.num_sge    = 1;
-        wr.opcode     = IBV_WR_SEND;
-        wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
-
-        ret = ibv_post_send(conn->rdma_id->qp, &wr, &bad_wr);
-        if (ret) {
-            LOG_ERROR("ibv_post_send() failed: %m");
-            return -1;
+        ret = poll_cq();
+        if (ret < 0) {
+            return ret;
         }
     }
 
-    LOG_TRACE("Sent packet %d conn_index %d", packet.type, packet.conn_index);
     return 0;
+}
+
+static int post_send_message(connection_t *conn, size_t offset, size_t length,
+                             int *posted)
+{
+    uintptr_t remote_addr;
+    struct ibv_sge sge;
+    int ret;
+
+    sge.addr    = (uintptr_t)g_test.rdma_buf.ptr + offset;
+    sge.length  = length;
+    sge.lkey    = g_test.rdma_buf.mr->lkey;
+
+    if (g_options.opcode == IBV_WR_RDMA_READ || g_options.opcode == IBV_WR_RDMA_WRITE) {
+        remote_addr = conn->remote_addr + offset;
+    } else {
+        remote_addr = 0;
+    }
+
+    ret = post_send(conn, &sge, g_options.opcode, 0, remote_addr, posted);
+    if (ret < 0) {
+        return ret;
+    }
+
+    if (*posted) {
+        conn->message_offset += length;
+    }
+    return ret;
 }
 
 static int handle_established(struct rdma_cm_event *event)
@@ -956,6 +1124,7 @@ static void dc_send_completion(const struct ibv_wc* wc)
 
 static int poll_cq()
 {
+    connection_t *conn;
     packet_t *packet;
     struct ibv_wc wc;
     int ret;
@@ -974,26 +1143,18 @@ static int poll_cq()
         case IBV_WC_RECV:
             /* Packet was received */
             packet = (packet_t*)wc.wr_id;
-            LOG_TRACE("Received packet %d conn_index %d at %p", packet->type,
-                      packet->conn_index, packet);
-            switch (packet->type) {
-            case PACKET_FIN:
-                ++g_test.num_fin_recvd;
-            default:
-                break;
-            }
+            conn = &g_test.conns[packet->conn_index];
+            ++conn->num_recvd[packet->type];
+            LOG_TRACE("Received packet %s id %d conn_index %d at %p, total: %d",
+                      packet_names[packet->type], packet->id, packet->conn_index,
+                      packet, conn->num_recvd[packet->type]);
             break;
         case IBV_WC_SEND:
-            /* Outgoing send was acknowledged on transport level */
-            LOG_TRACE("SEND completion wr_id %ld", wc.wr_id);
-            if (g_options.transport == XPORT_DC) {
-                dc_send_completion(&wc);
-            }
-            break;
         case IBV_WC_RDMA_READ:
-            /* Outgoing RDMA_READ was completed */
-            LOG_TRACE("RDMA_READ completion wr_id %ld", wc.wr_id);
-            --g_test.num_outstanding_reads;
+        case IBV_WC_RDMA_WRITE:
+            LOG_TRACE("%s completion wr_id %ld", wc_opcode_names[wc.opcode],
+                      wc.wr_id);
+            --g_test.num_outstanding;
             if (g_options.transport == XPORT_DC) {
                 dc_send_completion(&wc);
             }
@@ -1006,28 +1167,14 @@ static int poll_cq()
     return 0;
 }
 
+static int do_barrier();
+
 static int disconnect()
 {
     unsigned i;
     int ret;
 
     LOG_INFO("Disconnecting %d connections", g_test.num_conns);
-
-    /* Send FIN messages on all connections */
-    for (i = 0; i < g_test.num_conns; ++i) {
-        ret = send_control(&g_test.conns[i], PACKET_FIN, i);
-        if (ret) {
-            return ret;
-        }
-    }
-
-    /* Wait for FIN messages on all connections */
-    while (g_test.num_fin_recvd < g_test.num_conns) {
-        ret = poll_cq();
-        if (ret) {
-            return ret;
-        }
-    }
 
     if (g_options.transport == XPORT_RC) {
 
@@ -1052,7 +1199,7 @@ static int disconnect()
     return 0;
 }
 
-static int run_client()
+static int connect_client()
 {
     struct sockaddr_in dest_addr;
     struct rdma_cm_id *rdma_id;
@@ -1091,148 +1238,125 @@ static int run_client()
         }
     }
 
-    ret = disconnect();
-    if (ret) {
-        return ret;
-    }
-
     return 0;
 }
 
-/* post rdma_read, set *posted to 1 if the operation was posted, 0 if no
- * available QP is found
- */
-static int post_rdma_read(connection_t *conn, size_t offset, size_t length,
-                          int *posted)
+static int barrier_send()
 {
-    struct ibv_sge sge;
-    uintptr_t remote_addr;
-    int dci;
+    int i, ret;
 
-    remote_addr = conn->remote_addr + offset;
-    sge.addr    = (uintptr_t)g_test.rdma_buf.ptr + offset;
-    sge.length  = length;
-    sge.lkey    = g_test.rdma_buf.mr->lkey;
-
-    if (g_options.transport == XPORT_RC) {
-        struct ibv_send_wr wr, *bad_wr;
-
-        memset(&wr, 0, sizeof(wr));
-        wr.sg_list             = &sge;
-        wr.num_sge             = 1;
-        wr.opcode              = IBV_WR_RDMA_READ;
-        wr.send_flags          = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = remote_addr;
-        wr.wr.rdma.rkey        = conn->rkey;
-
-        int ret = ibv_post_send(conn->rdma_id->qp, &wr, &bad_wr);
-        if (ret) {
-            LOG_DEBUG("ibv_post_send() failed: %m");
+    for (i = 0; i < g_test.num_conns; ++i) {
+        ret = send_control(&g_test.conns[i], PACKET_SYN, g_test.barrier_count);
+        if (ret < 0) {
             return ret;
         }
-
-        *posted = 1;
-
-        LOG_TRACE("RDMA_READ on QP 0x%x remote_address 0x%lx length %u into 0x%lx",
-                  conn->rdma_id->qp->qp_num, wr.wr.rdma.remote_addr, sge.length,
-                  sge.addr);
-    } else if (g_options.transport == XPORT_DC) {
-
-        struct ibv_exp_send_wr wr, *bad_wr;
-
-        if (!g_test.free_dci_bitmap) {
-            *posted = 0;
-            goto out;
-        }
-
-        /* find an available DCI */
-        dci = __builtin_ffsl(g_test.free_dci_bitmap) - 1;
-        assert(g_test.dci_outstanding[dci] == 0);
-
-        memset(&wr, 0, sizeof(wr));
-        wr.wr_id               = dci;
-        wr.sg_list             = &sge;
-        wr.num_sge             = 1;
-        wr.exp_opcode          = IBV_EXP_WR_RDMA_READ;
-        wr.exp_send_flags      = IBV_EXP_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = remote_addr;
-        wr.wr.rdma.rkey        = conn->rkey;
-        wr.dc.ah               = conn->dc_ah;
-        wr.dc.dct_number       = conn->remote_dctn;
-        wr.dc.dct_access_key   = DC_KEY;
-
-        int ret = ibv_exp_post_send(g_test.dcis[dci], &wr, &bad_wr);
-        if (ret) {
-            LOG_DEBUG("ibv_post_send() failed: %m");
-            return ret;
-        }
-
-        ++g_test.dci_outstanding[dci];
-        g_test.free_dci_bitmap &= ~BIT(dci);
-        *posted = 1;
-
-        LOG_TRACE("RDMA_READ on DCI[%d] 0x%x remote_address 0x%lx length %u into 0x%lx",
-                  dci, g_test.dcis[dci]->qp_num, wr.wr.rdma.remote_addr, sge.length,
-                  sge.addr);
-    } else {
-        *posted = 0;
     }
 
-    /* Update counters */
-    if (*posted) {
-        ++g_test.num_outstanding_reads;
-        conn->read_offset += length;
-    }
-
-out:
     return 0;
 }
 
-static int do_rdma_reads()
+static int barrier_recv()
+{
+    int done, i, ret;
+
+    do {
+        ret = poll_cq();
+        if (ret < 0) {
+            return ret;
+        }
+
+        /* expect each connection to receive the barrier */
+        done = 1;
+        for (i = 0; i < g_test.num_conns; ++i) {
+            if (g_test.conns[i].num_recvd[PACKET_SYN] < g_test.barrier_count) {
+                done = 0;
+                break;
+            }
+        }
+    } while (!done);
+
+    return 0;
+}
+
+static int do_barrier()
+{
+    int ret;
+
+    ++g_test.barrier_count;
+
+    LOG_DEBUG("performing barrier # %d with %d connections",
+              g_test.barrier_count, g_test.num_conns);
+
+    if (is_client()) {
+        ret = barrier_send();
+        ret = (ret < 0) ? ret : barrier_recv();
+    } else {
+        ret = barrier_recv();
+        ret = (ret < 0) ? ret : barrier_send();
+    }
+
+    return ret;
+}
+
+static int run_traffic()
 {
     struct timeval tv_start, tv_end;
     connection_t *conn;
     double sec_elapsed;
     unsigned i, iter;
     size_t size, bytes_transferred;
+    int do_post_send;
     int posted;
     int ret;
     LIST_HEAD(sched);
 
-    g_test.num_outstanding_reads = 0;
+    /*
+     * Which side should post sends?
+     * client: for SEND and RDMA_WRITE
+     * server: for RDMA_READ
+     */
+    do_post_send = (is_client() && ((g_options.opcode == IBV_WR_RDMA_WRITE ||
+                    g_options.opcode == IBV_WR_SEND))) ||
+                                    (!is_client() && (g_options.opcode == IBV_WR_RDMA_READ));
+
+    g_test.num_outstanding = 0;
 
     /* measure the time over several iterations */
     gettimeofday(&tv_start, NULL);
+
     for (iter = 0; iter < g_options.num_iterations; ++iter) {
+
         /* insert all connections to the schedule queue */
-        for (i = 0; i < g_test.num_conns; ++i) {
-            g_test.conns[i].read_offset = 0;
-            list_add_tail(&sched, &g_test.conns[i].list);
+        if (do_post_send) {
+            for (i = 0; i < g_test.num_conns; ++i) {
+                g_test.conns[i].message_offset = 0;
+                list_add_tail(&sched, &g_test.conns[i].list);
+            }
         }
 
         /* As long as not all read operations are completed, and the list is not
          * empty, continue working
          */
-        while (g_test.num_outstanding_reads || !list_is_empty(&sched)) {
+        while (g_test.num_outstanding || !list_is_empty(&sched)) {
 
             /* If there are more connections with pending data, and we have not
              * exceeded the total number of outstanding reads, post the next
              * read operation
              */
             if (!list_is_empty(&sched) &&
-                (g_test.num_outstanding_reads < g_options.max_outstanding_reads))
+                (g_test.num_outstanding < g_options.max_outstanding))
             {
                 /* take the first connection from the schedule queue */
                 conn = list_extract_head(&sched, connection_t, list);
 
                 /* see how many bytes are left to read */
-                size = MIN(g_options.max_read_size,
-                           g_options.rdma_read_size - conn->read_offset);
+                size = MIN(g_options.max_seg_size,
+                           g_options.message_size - conn->message_offset);
                 assert(size > 0);
 
-                /* issue rdma read on the next segment */
+                /* send next message */
                 posted = 0;
-                ret = post_rdma_read(conn, conn->read_offset, size, &posted);
+                ret = post_send_message(conn, conn->message_offset, size, &posted);
                 if (ret < 0) {
                     return ret;
                 }
@@ -1241,7 +1365,7 @@ static int do_rdma_reads()
                     /* if this connection is not done, reinsert it to the tail of
                      * the schedule queue
                      */
-                    if (conn->read_offset < g_options.rdma_read_size) {
+                    if (conn->message_offset < g_options.message_size) {
                         list_add_tail(&sched, &conn->list);
                     }
                 } else {
@@ -1256,24 +1380,43 @@ static int do_rdma_reads()
             }
         }
     }
+
+    assert(g_test.num_outstanding == 0);
+
     gettimeofday(&tv_end, NULL);
 
     /* make sure everything was read */
-    for (i = 0; i < g_test.num_conns; ++i) {
-        assert(g_test.conns[i].read_offset == g_options.rdma_read_size);
-    }
+    if (do_post_send) {
+        for (i = 0; i < g_test.num_conns; ++i) {
+            assert(g_test.conns[i].message_offset == g_options.message_size);
+        }
 
-    /* Calculate and report total read bandwidth */
-    sec_elapsed = (tv_end.tv_sec - tv_start.tv_sec) +
-                  (tv_end.tv_usec - tv_start.tv_usec) * 1e-6;
-    bytes_transferred = g_test.num_conns * 
-                        g_options.num_iterations * g_options.rdma_read_size;
-    LOG_INFO("Total read bandwidth: %.2f MB/s",
-             bytes_transferred / sec_elapsed / BIT(20));
+        /* Calculate and report total read bandwidth */
+        sec_elapsed = (tv_end.tv_sec - tv_start.tv_sec) +
+                      (tv_end.tv_usec - tv_start.tv_usec) * 1e-6;
+        bytes_transferred = g_test.num_conns *
+                            g_options.num_iterations * g_options.message_size;
+        LOG_INFO("Total bandwidth: %.2f MB/s",
+                 bytes_transferred / sec_elapsed / BIT(20));
+    }
     return 0;
 }
 
-static int run_server()
+static int run_traffic_multi()
+{
+    int i, ret;
+
+    for (i = 0; i < 10; ++i) {
+        ret = run_traffic();
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    return 0;
+}
+
+static int connect_server()
 {
     struct sockaddr_in in_addr;
     int ret;
@@ -1321,16 +1464,6 @@ static int run_server()
         }
     }
 
-    ret = do_rdma_reads();
-    if (ret) {
-        return ret;
-    }
-
-    ret = disconnect();
-    if (ret) {
-        return ret;
-    }
-
     return 0;
 }
 
@@ -1349,12 +1482,32 @@ int main(int argc, char **argv)
     }
 
     if (is_client()) {
-        ret = run_client();
+        ret = connect_client();
     } else {
-        ret = run_server();
+        ret = connect_server();
     }
 
-    cleanup_test();
+    ret = do_barrier();
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = run_traffic_multi();
+    if (ret) {
+        return ret;
+    }
+
+    ret = do_barrier();
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = disconnect();
+    if (ret) {
+        return ret;
+    }
+
+   cleanup_test();
 
     return ret;
 }
