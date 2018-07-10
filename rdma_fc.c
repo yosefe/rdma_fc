@@ -258,7 +258,7 @@ static int value_by_str(const char *str, const char **names, int max)
     int i;
 
     for (i = 0; i < max; ++i) {
-        if (!strcasecmp(str, names[i])) {
+        if (names[i] && !strcasecmp(str, names[i])) {
             return i;
         }
     }
@@ -1136,6 +1136,8 @@ static int poll_cq()
         if (wc.status != IBV_WC_SUCCESS) {
             LOG_ERROR("Completion with error: %s, vendor_err 0x%x",
                       ibv_wc_status_str(wc.status), wc.vendor_err);
+            LOG_ERROR("Press any key to exit...");
+            getchar();
             return -1;
         }
 
@@ -1175,6 +1177,11 @@ static int disconnect()
     int ret;
 
     LOG_INFO("Disconnecting %d connections", g_test.num_conns);
+
+    ret = do_barrier();
+    if (ret < 0) {
+        return ret;
+    }
 
     if (g_options.transport == XPORT_RC) {
 
@@ -1294,6 +1301,9 @@ static int do_barrier()
         ret = barrier_recv();
         ret = (ret < 0) ? ret : barrier_send();
     }
+
+    LOG_DEBUG("done barrier # %d with %d connections",
+              g_test.barrier_count, g_test.num_conns);
 
     return ret;
 }
@@ -1486,6 +1496,9 @@ int main(int argc, char **argv)
     } else {
         ret = connect_server();
     }
+    if (ret) {
+        return ret;
+    }
 
     ret = do_barrier();
     if (ret < 0) {
@@ -1507,7 +1520,7 @@ int main(int argc, char **argv)
         return ret;
     }
 
-   cleanup_test();
+    cleanup_test();
 
     return ret;
 }
