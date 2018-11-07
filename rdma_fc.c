@@ -152,7 +152,6 @@ typedef struct {
     uint32_t                  dct_num;     /* DCT number (for DC only) */
     uint32_t                  rkey;        /* Remote key for RDMA */
     uint64_t                  virt_addr;   /* Remote buffer address for RDMA */
-    union ibv_gid             gid;         /* GID to use for sending packets */
 } conn_priv_t;
 
 static const char* transport_names[] = {
@@ -721,8 +720,6 @@ static int get_conn_param(struct rdma_cm_id *rdma_id,
                           struct rdma_conn_param *conn_param,
                           conn_priv_t *priv, unsigned conn_index)
 {
-    int ret;
-
     memset(conn_param, 0, sizeof(*conn_param));
 
     priv->conn_index          = conn_index;
@@ -731,14 +728,6 @@ static int get_conn_param(struct rdma_cm_id *rdma_id,
                                 (conn_index * g_options.message_size);
     if (g_options.transport == XPORT_DC) {
         priv->dct_num         = g_test.dct->dct_num;
-
-        ret = ibv_query_gid(rdma_id->verbs, rdma_id->port_num,
-                            g_options.gid_index, &priv->gid);
-        if (ret) {
-            LOG_ERROR("ibv_query_gid(port=%d index=%d) failed: %m",
-                      rdma_id->port_num, g_options.gid_index);
-            return ret;
-        }
     }
 
     conn_param->private_data        = priv;
@@ -751,29 +740,33 @@ static int get_conn_param(struct rdma_cm_id *rdma_id,
     return 0;
 }
 
+/* get this from rdmacm */
+int rdma_init_qp_attr(struct rdma_cm_id *id, struct ibv_qp_attr *qp_attr,
+                      int *qp_attr_mask);
+
 static int set_conn_param(connection_t *conn, struct rdma_cm_event *event)
 {
     const conn_priv_t *remote_priv = event->param.conn.private_data;
-    struct ibv_ah_attr ah_attr;
+    struct ibv_qp_attr qp_attr = {0};
+    int qp_attr_mask = 0;
+    int ret;
 
     conn->remote_addr       = remote_priv->virt_addr;
     conn->rkey              = remote_priv->rkey;
     conn->remote_conn_index = remote_priv->conn_index;
 
     if (g_options.transport == XPORT_DC) {
-        memset(&ah_attr, 0, sizeof(ah_attr));
+        qp_attr.qp_state = IBV_QPS_RTR;
+        ret = rdma_init_qp_attr(event->id, &qp_attr, &qp_attr_mask);
+        if (ret) {
+            LOG_ERROR("rdma_init_qp_attr() failed: %m");
+            return ret;
+        }
 
-        ah_attr.is_global         = 1;
-        ah_attr.port_num          = event->id->port_num;
-        ah_attr.sl                = g_options.sl;
-        ah_attr.grh.dgid          = remote_priv->gid;
-        ah_attr.grh.sgid_index    = g_options.gid_index;
-        ah_attr.grh.hop_limit     = g_options.hop_limit;
-        ah_attr.grh.traffic_class = g_options.traffic_class;
-
-        conn->dc_ah = ibv_create_ah(event->id->pd, &ah_attr);
+        conn->dc_ah = ibv_create_ah(event->id->pd, &qp_attr.ah_attr);
         if (!conn->dc_ah) {
-            LOG_ERROR("ibv_create_ah(port_num=%d) failed: %m", ah_attr.port_num );
+            LOG_ERROR("ibv_create_ah(port_num=%d) failed: %m",
+                      qp_attr.ah_attr.port_num);
             return -1;
         }
 
@@ -833,11 +826,6 @@ static int handle_connect_request(struct rdma_cm_event *event)
     if (ret) {
         LOG_ERROR("rdma_accept() failed: %m");
         return -1;
-    }
-
-    if (g_options.transport == XPORT_DC) {
-        /* For DC server, the connection is ready after getting a connect request */
-        ++g_test.num_established;
     }
 
     return 0;
@@ -965,7 +953,7 @@ static int send_control(connection_t *conn, enum packet_type type, int id)
     sge.length = sizeof(packet);
     sge.lkey   = 0;
 
-    assert(IBV_SEND_INLINE == IBV_EXP_SEND_INLINE);
+    assert((int)IBV_SEND_INLINE == (int)IBV_EXP_SEND_INLINE);
 
     for (;;) {
         ret = post_send(conn, &sge, IBV_WR_SEND, IBV_SEND_INLINE, 0, &posted);
@@ -1108,7 +1096,7 @@ out_ack_event:
 
 static enum rdma_port_space get_port_space()
 {
-    return (g_options.transport == XPORT_RC) ? RDMA_PS_TCP : RDMA_PS_UDP;
+    return RDMA_PS_TCP;
 }
 
 static void dc_send_completion(const struct ibv_wc* wc)
@@ -1183,23 +1171,20 @@ static int disconnect()
         return ret;
     }
 
-    if (g_options.transport == XPORT_RC) {
-
-        /* With RC, send rdma_cm disconnects on all connections */
-        for (i = 0; i < g_test.num_conns; ++i) {
-            ret = rdma_disconnect(g_test.conns[i].rdma_id);
-            if (ret) {
-                LOG_ERROR("rdma_disconnect() failed: %m");
-                return ret;
-            }
+    /* Send rdma_cm disconnects on all connections */
+    for (i = 0; i < g_test.num_conns; ++i) {
+        ret = rdma_disconnect(g_test.conns[i].rdma_id);
+        if (ret) {
+            LOG_ERROR("rdma_disconnect() failed: %m");
+            return ret;
         }
+    }
 
-        /* Wait for rdma_cm disconnects on all connections */
-        while (g_test.num_disconnect < g_test.num_conns) {
-            ret = wait_and_process_one_event(BIT(RDMA_CM_EVENT_DISCONNECTED));
-            if (ret) {
-                return ret;
-            }
+    /* Wait for rdma_cm disconnects on all connections */
+    while (g_test.num_disconnect < g_test.num_conns) {
+        ret = wait_and_process_one_event(BIT(RDMA_CM_EVENT_DISCONNECTED));
+        if (ret) {
+            return ret;
         }
     }
 

@@ -5,7 +5,7 @@
 #
 
 CFLAGS  = -Wall -Werror -g -O2
-LDFLAGS = -libverbs -lrdmacm
+LDFLAGS = -libverbs -lrdmacm -L$(HOME)/workspace/driver/librdmacm/build/src/.libs
 RM      = rm -f
 
 all: rdma_fc
